@@ -71,6 +71,8 @@ def _make_agent(monkeypatch):
 
         def _has_stream_consumers(self):
             return False
+        def _apply_pending_steer_to_tool_results(self, messages, num_tool_msgs):
+            pass
 
     stub = _Stub()
     # Bind the real methods under test
