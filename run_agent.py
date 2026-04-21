@@ -955,6 +955,168 @@ class AIAgent:
         # same image history.
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
+        # Initialize LLM client, fallback chain, and tools
+        self._init_api_client(
+            api_key=api_key,
+            base_url=base_url,
+            provider=provider,
+            api_mode=api_mode,
+            acp_command=self.acp_command,
+            acp_args=self.acp_args,
+            fallback_model=fallback_model,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            is_native_anthropic=is_native_anthropic,
+            is_openrouter=is_openrouter,
+        )
+        # Provider fallback chain — ordered list of backup providers tried
+        # when the primary is exhausted (rate-limit, overload, connection
+        # failure).  Supports both legacy single-dict ``fallback_model`` and
+        # new list ``fallback_providers`` format.
+        if isinstance(fallback_model, list):
+            self._fallback_chain = [
+                f for f in fallback_model
+                if isinstance(f, dict) and f.get("provider") and f.get("model")
+            ]
+        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+            self._fallback_chain = [fallback_model]
+        else:
+            self._fallback_chain = []
+        self._fallback_index = 0
+        self._fallback_activated = False
+        # Legacy attribute kept for backward compat (tests, external callers)
+        self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+        if self._fallback_chain and not self.quiet_mode:
+            if len(self._fallback_chain) == 1:
+                fb = self._fallback_chain[0]
+                print(f"🔄 Fallback model: {fb['model']} ({fb['provider']})")
+            else:
+                print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
+                      " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
+
+        # Get available tools with filtering
+        self.tools = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=self.quiet_mode,
+        )
+        
+        # Show tool configuration and store valid tool names for validation
+        self.valid_tool_names = set()
+        if self.tools:
+            self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
+            tool_names = sorted(self.valid_tool_names)
+            if not self.quiet_mode:
+                print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
+                
+                # Show filtering info if applied
+                if enabled_toolsets:
+                    print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
+                if disabled_toolsets:
+                    print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
+        elif not self.quiet_mode:
+            print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+        
+        # Check tool requirements
+        if self.tools and not self.quiet_mode:
+            requirements = check_toolset_requirements()
+            missing_reqs = [name for name, available in requirements.items() if not available]
+            if missing_reqs:
+                print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
+        
+        # Show trajectory saving status
+        if self.save_trajectories and not self.quiet_mode:
+            print("📝 Trajectory saving enabled")
+        
+        # Show ephemeral system prompt status
+        if self.ephemeral_system_prompt and not self.quiet_mode:
+            prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
+            print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
+        
+        # Show prompt caching status
+        if self._use_prompt_caching and not self.quiet_mode:
+            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
+            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+        
+        # Session logging, checkpoint, DB, and config load
+        self._init_session(
+            session_id=session_id,
+            session_db=session_db,
+            parent_session_id=parent_session_id,
+            checkpoints_enabled=checkpoints_enabled,
+            checkpoint_max_snapshots=checkpoint_max_snapshots,
+            reasoning_config=reasoning_config,
+            max_tokens=max_tokens,
+        )
+
+        # Load config once for memory, skills, and compression sections
+        try:
+            from hermes_cli.config import load_config as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
+
+        # Persistent memory + memory provider plugin setup
+        self._init_memory(
+            skip_memory=skip_memory,
+            agent_cfg=_agent_cfg,
+            platform=platform,
+        )
+        # Skills config: nudge interval for skill creation reminders
+        self._skill_nudge_interval = 10
+        try:
+            skills_config = _agent_cfg.get("skills", {})
+            self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
+        except Exception:
+            pass
+
+        # Tool-use enforcement config: "auto" (default — matches hardcoded
+        # model list), true (always), false (never), or list of substrings.
+        _agent_section = _agent_cfg.get("agent", {})
+        if not isinstance(_agent_section, dict):
+            _agent_section = {}
+        self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+        # Context compressor, engine selection, and validation
+        self._init_compressor(
+            agent_cfg=_agent_cfg,
+        )
+
+
+        self._subdirectory_hints = SubdirectoryHintTracker(
+            working_dir=os.getenv("TERMINAL_CWD") or None,
+        )
+        self._user_turn_count = 0
+
+        # Cumulative token usage for the session
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.session_total_tokens = 0
+        self.session_api_calls = 0
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_reasoning_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+        self.session_cost_status = "unknown"
+        self.session_cost_source = "none"
+
+    def _init_api_client(
+        self,
+        api_key: str = None,
+        base_url: str = None,
+        provider: str = None,
+        api_mode: str = None,
+        acp_command: str = None,
+        acp_args: list = None,
+        fallback_model=None,
+        enabled_toolsets: list = None,
+        disabled_toolsets: list = None,
+        is_native_anthropic: bool = False,
+        is_openrouter: bool = False,
+    ):
+        """Initialize LLM client, fallback chain, and tools."""
         # Initialize LLM client via centralized provider router.
         # The router handles auth resolution, base URL, headers, and
         # Codex/Anthropic wrapping for all known providers.
@@ -1143,145 +1305,16 @@ class AIAgent:
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-        # Provider fallback chain — ordered list of backup providers tried
-        # when the primary is exhausted (rate-limit, overload, connection
-        # failure).  Supports both legacy single-dict ``fallback_model`` and
-        # new list ``fallback_providers`` format.
-        if isinstance(fallback_model, list):
-            self._fallback_chain = [
-                f for f in fallback_model
-                if isinstance(f, dict) and f.get("provider") and f.get("model")
-            ]
-        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-            self._fallback_chain = [fallback_model]
-        else:
-            self._fallback_chain = []
-        self._fallback_index = 0
-        self._fallback_activated = False
-        # Legacy attribute kept for backward compat (tests, external callers)
-        self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
-        if self._fallback_chain and not self.quiet_mode:
-            if len(self._fallback_chain) == 1:
-                fb = self._fallback_chain[0]
-                print(f"🔄 Fallback model: {fb['model']} ({fb['provider']})")
-            else:
-                print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
-                      " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
-        # Get available tools with filtering
-        self.tools = get_tool_definitions(
-            enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=disabled_toolsets,
-            quiet_mode=self.quiet_mode,
-        )
-        
-        # Show tool configuration and store valid tool names for validation
-        self.valid_tool_names = set()
-        if self.tools:
-            self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
-            tool_names = sorted(self.valid_tool_names)
-            if not self.quiet_mode:
-                print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
-                
-                # Show filtering info if applied
-                if enabled_toolsets:
-                    print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
-                if disabled_toolsets:
-                    print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
-        elif not self.quiet_mode:
-            print("🛠️  No tools loaded (all tools filtered out or unavailable)")
-        
-        # Check tool requirements
-        if self.tools and not self.quiet_mode:
-            requirements = check_toolset_requirements()
-            missing_reqs = [name for name, available in requirements.items() if not available]
-            if missing_reqs:
-                print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
-        
-        # Show trajectory saving status
-        if self.save_trajectories and not self.quiet_mode:
-            print("📝 Trajectory saving enabled")
-        
-        # Show ephemeral system prompt status
-        if self.ephemeral_system_prompt and not self.quiet_mode:
-            prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
-            print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
-        
-        # Show prompt caching status
-        if self._use_prompt_caching and not self.quiet_mode:
-            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
-            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
-        
-        # Session logging setup - auto-save conversation trajectories for debugging
-        self.session_start = datetime.now()
-        if session_id:
-            # Use provided session ID (e.g., from CLI)
-            self.session_id = session_id
-        else:
-            # Generate a new session ID
-            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-            short_uuid = uuid.uuid4().hex[:6]
-            self.session_id = f"{timestamp_str}_{short_uuid}"
-        
-        # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
-        hermes_home = get_hermes_home()
-        self.logs_dir = hermes_home / "sessions"
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-        
-        # Track conversation messages for session logging
-        self._session_messages: List[Dict[str, Any]] = []
-        
-        # Cached system prompt -- built once per session, only rebuilt on compression
-        self._cached_system_prompt: Optional[str] = None
-        
-        # Filesystem checkpoint manager (transparent — not a tool)
-        from tools.checkpoint_manager import CheckpointManager
-        self._checkpoint_mgr = CheckpointManager(
-            enabled=checkpoints_enabled,
-            max_snapshots=checkpoint_max_snapshots,
-        )
-        
-        # SQLite session store (optional -- provided by CLI or gateway)
-        self._session_db = session_db
-        self._parent_session_id = parent_session_id
-        self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
-        if self._session_db:
-            try:
-                self._session_db.create_session(
-                    session_id=self.session_id,
-                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                    model=self.model,
-                    model_config={
-                        "max_iterations": self.max_iterations,
-                        "reasoning_config": reasoning_config,
-                        "max_tokens": max_tokens,
-                    },
-                    user_id=None,
-                    parent_session_id=self._parent_session_id,
-                )
-            except Exception as e:
-                # Transient SQLite lock contention (e.g. CLI and gateway writing
-                # concurrently) must NOT permanently disable session_search for
-                # this agent.  Keep _session_db alive — subsequent message
-                # flushes and session_search calls will still work once the
-                # lock clears.  The session row may be missing from the index
-                # for this run, but that is recoverable (flushes upsert rows).
-                logger.warning(
-                    "Session DB create_session failed (session_search still available): %s", e
-                )
-        
-        # In-memory todo list for task planning (one per agent/session)
-        from tools.todo_tool import TodoStore
-        self._todo_store = TodoStore()
-        
-        # Load config once for memory, skills, and compression sections
-        try:
-            from hermes_cli.config import load_config as _load_agent_config
-            _agent_cfg = _load_agent_config()
-        except Exception:
-            _agent_cfg = {}
-
+    def _init_memory(
+        self,
+        skip_memory: bool = False,
+        agent_cfg: dict = None,
+        platform: str = None,
+    ):
+        """Initialize persistent memory store and memory provider plugin."""
+        _agent_cfg = agent_cfg or {}
+        mem_config = None
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -1410,21 +1443,87 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     _existing_tool_names.add(_tname)
 
-        # Skills config: nudge interval for skill creation reminders
-        self._skill_nudge_interval = 10
-        try:
-            skills_config = _agent_cfg.get("skills", {})
-            self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-        except Exception:
-            pass
 
-        # Tool-use enforcement config: "auto" (default — matches hardcoded
-        # model list), true (always), false (never), or list of substrings.
-        _agent_section = _agent_cfg.get("agent", {})
-        if not isinstance(_agent_section, dict):
-            _agent_section = {}
-        self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+    def _init_session(
+        self,
+        session_id: str = None,
+        session_db=None,
+        parent_session_id: str = None,
+        checkpoints_enabled: bool = False,
+        checkpoint_max_snapshots: int = 50,
+        reasoning_config: Dict[str, Any] = None,
+        max_tokens: int = None,
+    ):
+        """Initialize session state, logging, checkpoint manager, and SQLite store."""
+        # Session logging setup - auto-save conversation trajectories for debugging
+        self.session_start = datetime.now()
+        if session_id:
+            # Use provided session ID (e.g., from CLI)
+            self.session_id = session_id
+        else:
+            # Generate a new session ID
+            timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
+            short_uuid = uuid.uuid4().hex[:6]
+            self.session_id = f"{timestamp_str}_{short_uuid}"
+        
+        # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
+        hermes_home = get_hermes_home()
+        self.logs_dir = hermes_home / "sessions"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+        
+        # Track conversation messages for session logging
+        self._session_messages: List[Dict[str, Any]] = []
+        
+        # Cached system prompt -- built once per session, only rebuilt on compression
+        self._cached_system_prompt: Optional[str] = None
+        
+        # Filesystem checkpoint manager (transparent — not a tool)
+        from tools.checkpoint_manager import CheckpointManager
+        self._checkpoint_mgr = CheckpointManager(
+            enabled=checkpoints_enabled,
+            max_snapshots=checkpoint_max_snapshots,
+        )
+        
+        # SQLite session store (optional -- provided by CLI or gateway)
+        self._session_db = session_db
+        self._parent_session_id = parent_session_id
+        self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+        if self._session_db:
+            try:
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model=self.model,
+                    model_config={
+                        "max_iterations": self.max_iterations,
+                        "reasoning_config": reasoning_config,
+                        "max_tokens": max_tokens,
+                    },
+                    user_id=None,
+                    parent_session_id=self._parent_session_id,
+                )
+            except Exception as e:
+                # Transient SQLite lock contention (e.g. CLI and gateway writing
+                # concurrently) must NOT permanently disable session_search for
+                # this agent.  Keep _session_db alive — subsequent message
+                # flushes and session_search calls will still work once the
+                # lock clears.  The session row may be missing from the index
+                # for this run, but that is recoverable (flushes upsert rows).
+                logger.warning(
+                    "Session DB create_session failed (session_search still available): %s", e
+                )
 
+        # In-memory todo list for task planning (one per agent/session)
+        from tools.todo_tool import TodoStore
+        self._todo_store = TodoStore()
+
+    def _init_compressor(
+        self,
+        agent_cfg: dict = None,
+    ):
+        """Initialize context compressor, engine selection, and validation."""
+        _agent_cfg = agent_cfg or {}
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -1578,61 +1677,6 @@ class AIAgent:
             )
         self.compression_enabled = compression_enabled
 
-        # Reject models whose context window is below the minimum required
-        # for reliable tool-calling workflows (64K tokens).
-        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
-        _ctx = getattr(self.context_compressor, "context_length", 0)
-        if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
-            raise ValueError(
-                f"Model {self.model} has a context window of {_ctx:,} tokens, "
-                f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
-                f"by Hermes Agent.  Choose a model with at least "
-                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
-                f"model.context_length in config.yaml to override."
-            )
-
-        # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
-        self._context_engine_tool_names: set = set()
-        if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
-            for _schema in self.context_compressor.get_tool_schemas():
-                _wrapped = {"type": "function", "function": _schema}
-                self.tools.append(_wrapped)
-                _tname = _schema.get("name", "")
-                if _tname:
-                    self.valid_tool_names.add(_tname)
-                    self._context_engine_tool_names.add(_tname)
-
-        # Notify context engine of session start
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            try:
-                self.context_compressor.on_session_start(
-                    self.session_id,
-                    hermes_home=str(get_hermes_home()),
-                    platform=self.platform or "cli",
-                    model=self.model,
-                    context_length=getattr(self.context_compressor, "context_length", 0),
-                )
-            except Exception as _ce_err:
-                logger.debug("Context engine on_session_start: %s", _ce_err)
-
-        self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
-        )
-        self._user_turn_count = 0
-
-        # Cumulative token usage for the session
-        self.session_prompt_tokens = 0
-        self.session_completion_tokens = 0
-        self.session_total_tokens = 0
-        self.session_api_calls = 0
-        self.session_input_tokens = 0
-        self.session_output_tokens = 0
-        self.session_cache_read_tokens = 0
-        self.session_cache_write_tokens = 0
-        self.session_reasoning_tokens = 0
-        self.session_estimated_cost_usd = 0.0
-        self.session_cost_status = "unknown"
-        self.session_cost_source = "none"
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -1702,7 +1746,42 @@ class AIAgent:
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
+        # Reject models whose context window is below the minimum required
+        # for reliable tool-calling workflows (64K tokens).
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+        _ctx = getattr(self.context_compressor, "context_length", 0)
+        if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
+            raise ValueError(
+                f"Model {self.model} has a context window of {_ctx:,} tokens, "
+                f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
+                f"by Hermes Agent.  Choose a model with at least "
+                f"{MINIMUM_CONTEXT_LENGTH // 1000}K context, or set "
+                f"model.context_length in config.yaml to override."
+            )
 
+        # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
+        self._context_engine_tool_names: set = set()
+        if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
+            for _schema in self.context_compressor.get_tool_schemas():
+                _wrapped = {"type": "function", "function": _schema}
+                self.tools.append(_wrapped)
+                _tname = _schema.get("name", "")
+                if _tname:
+                    self.valid_tool_names.add(_tname)
+                    self._context_engine_tool_names.add(_tname)
+
+        # Notify context engine of session start
+        if hasattr(self, "context_compressor") and self.context_compressor:
+            try:
+                self.context_compressor.on_session_start(
+                    self.session_id,
+                    hermes_home=str(get_hermes_home()),
+                    platform=self.platform or "cli",
+                    model=self.model,
+                    context_length=getattr(self.context_compressor, "context_length", 0),
+                )
+            except Exception as _ce_err:
+                logger.debug("Context engine on_session_start: %s", _ce_err)
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
         
