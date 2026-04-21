@@ -4156,9 +4156,10 @@ class TestDeadRetryCode:
         import inspect
         source = inspect.getsource(AIAgent.run_conversation)
         occurrences = source.count("if retry_count >= max_retries:")
-        assert occurrences == 2, (
-            f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
-            f"but found {occurrences}"
+        assert occurrences == 1, (
+            f"Expected 1 occurrence of 'if retry_count >= max_retries:' "
+            f"but found {occurrences}. "
+            f"The second was moved to _handle_api_error during method extraction."
         )
 
 
