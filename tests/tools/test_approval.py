@@ -156,16 +156,16 @@ class TestSessionKeyContext:
         run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
         module = ast.parse(run_py.read_text(encoding="utf-8"))
 
-        run_sync = None
+        target_func = None
         for node in ast.walk(module):
-            if isinstance(node, ast.FunctionDef) and node.name == "run_sync":
-                run_sync = node
+            if isinstance(node, ast.FunctionDef) and node.name == "_process_tool_calls":
+                target_func = node
                 break
 
-        assert run_sync is not None, "gateway.run.run_sync not found"
+        assert target_func is not None, "gateway.run._process_tool_calls not found"
 
         called_names = set()
-        for node in ast.walk(run_sync):
+        for node in ast.walk(target_func):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called_names.add(node.func.id)
 
