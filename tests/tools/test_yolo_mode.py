@@ -56,7 +56,7 @@ class TestYoloMode:
 
     def test_dangerous_command_approved_in_yolo_mode(self, monkeypatch):
         """With HERMES_YOLO_MODE, dangerous commands are auto-approved."""
-        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.setenv("HERMES_SESSION_KEY", "test-session")
 
@@ -66,7 +66,7 @@ class TestYoloMode:
 
     def test_yolo_mode_works_for_all_patterns(self, monkeypatch):
         """Yolo mode bypasses all dangerous patterns, not just some."""
-        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
         dangerous_commands = [
@@ -84,7 +84,7 @@ class TestYoloMode:
 
     def test_combined_guard_bypasses_yolo_mode(self, monkeypatch):
         """The new combined guard should preserve yolo bypass semantics."""
-        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
         called = {"value": False}
