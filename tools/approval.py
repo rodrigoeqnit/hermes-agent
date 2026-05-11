@@ -18,6 +18,8 @@ import time
 import unicodedata
 from typing import Optional
 
+from utils import is_truthy_value
+
 logger = logging.getLogger(__name__)
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
